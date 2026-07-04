@@ -22,11 +22,20 @@
 //!     "_embed": { "embedding": ["passage one", "passage two"] }
 //! })).await?;
 //!
-//! // Search.
-//! let res = client.search("posts",
-//!     &SearchRequest::new(QueryClause::hybrid("embedding", "retire elasticsearch"))).await?;
-//! for hit in res.hits.hits {
-//!     println!("{} ({:.3})", hit.id, hit.score);
+//! // Search — filter by tag and facet the results in one request.
+//! use search_service::{Agg, Filter};
+//! let res = client.search("posts", &SearchRequest::new(
+//!         QueryClause::bool()
+//!             .must(QueryClause::match_field("body", "search"))
+//!             .filter(Filter::term("tags", "db")))
+//!     .agg("tags", Agg::terms("tags").size(10))).await?;
+//! for hit in &res.hits.hits {
+//!     println!("{} ({:.3})", hit.id, hit.score.unwrap_or(0.0));
+//! }
+//! if let Some(tags) = res.agg("tags") {
+//!     for b in &tags.buckets {
+//!         println!("  {:?}: {}", b.key, b.doc_count);
+//!     }
 //! }
 //! # Ok(())
 //! # }
@@ -40,6 +49,9 @@ mod schema;
 
 pub use client::Client;
 pub use error::{Error, Result};
-pub use query::{MultiMatch, QueryClause, SearchRequest, VectorQuery};
-pub use response::{Document, Hit, Hits, SearchResponse, Total};
+pub use query::{
+    Agg, BoolFilter, BoolQuery, ExistsClause, Filter, MultiMatch, QueryClause, RangeAgg,
+    RangeBounds, RangeBucketDef, RangeFilter, SearchRequest, TermsAgg, VectorQuery,
+};
+pub use response::{AggResult, Bucket, Document, Hit, Hits, SearchResponse, Total};
 pub use schema::{FieldDef, FieldType, IndexInfo, MappingChanges, Schema, SchemaBuilder};

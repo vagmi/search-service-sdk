@@ -42,8 +42,9 @@ async fn main() -> search_service::Result<()> {
     let res = client.search("posts",
         &SearchRequest::new(QueryClause::hybrid("embedding", "retire elasticsearch"))).await?;
     for hit in res.hits.hits {
-        // chunk hits carry chunk_id / seq / content; document hits carry source / meta
-        println!("{} ({:.3}) {:?}", hit.id, hit.score, hit.content);
+        // chunk hits carry chunk_id / seq / content; document hits carry source / meta.
+        // `score` is None for filter-only queries (a `bool` with no scoring `must`).
+        println!("{} ({:.3}) {:?}", hit.id, hit.score.unwrap_or(0.0), hit.content);
     }
     Ok(())
 }
@@ -66,10 +67,90 @@ All methods are `async` on [`Client`].
 | `delete_document(index, id)` | `DELETE /{index}/_doc/{id}` |
 | `search(index, &SearchRequest) -> SearchResponse` | `POST /{index}/_search` |
 
-Build mappings with [`Schema::builder`] and queries with the
-[`QueryClause`] constructors (`match_field`, `multi_match`, `knn`, `hybrid`).
+Build mappings with [`Schema::builder`] and queries with the [`QueryClause`]
+constructors (`match_field`, `multi_match`, `knn`, `hybrid`, `bool`).
 `SearchRequest::new(..).size(n).from(m)` sets paging. Document bodies are any
 `Serialize` value (e.g. `serde_json::json!`), so `_meta` / `_embed` are passed inline.
+
+## Filtering
+
+`keyword` fields are multi-valued (a string or an array of strings) and filterable.
+A `bool` query pairs a scoring `must` (`match`/`multi_match`) with a filter context —
+`filter`/`must_not` restrict which documents match but never change the score:
+
+```rust
+use search_service::{Filter, QueryClause, SearchRequest};
+
+let query = QueryClause::bool()
+    .must(QueryClause::match_field("body", "postgres"))
+    .filter(Filter::terms("tags", ["rust", "db"]))   // keyword membership (any)
+    .filter(Filter::range("views").gte(100))          // numeric/date bounds
+    .must_not(Filter::term("published", false));
+let res = client.search("posts", &SearchRequest::new(query)).await?;
+```
+
+Filter clauses: `Filter::term`, `Filter::terms`, `Filter::range(..).gte/gt/lte/lt`,
+`Filter::exists`, and `Filter::bool()` (nested `should`/`must`/`must_not`/`filter`).
+A `bool` with no `must` is a filtered `match_all` — hits are ordered by recency and
+carry `score == None`.
+
+## Faceted search
+
+Add aggregations to get bucket counts over the whole matching set (independent of
+paging — use `.size(0)` for a facets-only response). Use `post_filter` for faceted
+navigation: it narrows the returned hits *after* aggregations are computed, so
+selecting a facet value doesn't collapse that facet's own counts.
+
+```rust
+use search_service::{Agg, Filter, QueryClause, SearchRequest};
+
+let req = SearchRequest::new(QueryClause::bool())
+    .size(0)
+    .agg("tags",  Agg::terms("tags").size(20))
+    .agg("views", Agg::range("views").below(100.0).between(100.0, 1000.0).above(1000.0))
+    .post_filter(Filter::term("tags", "rust"));
+
+let res = client.search("posts", &req).await?;
+if let Some(tags) = res.agg("tags") {
+    for b in &tags.buckets {
+        println!("{:?}: {}", b.key, b.doc_count);
+    }
+}
+```
+
+## Filtered vector search
+
+`knn`/`hybrid` accept a `filter` on the parent document's fields (ES `knn.filter`);
+the service pre-filters to the matching documents before scanning chunk embeddings.
+Build a [`VectorQuery`] directly to attach one:
+
+```rust
+use search_service::{Filter, QueryClause, SearchRequest, VectorQuery};
+
+let knn = VectorQuery::new("embedding", "combine lexical and vector search")
+    .k(20)
+    .filter(Filter::term("tags", "db"));
+let res = client.search("posts", &SearchRequest::new(QueryClause::Knn(knn))).await?;
+```
+
+## Examples
+
+Runnable, commented examples live in [`examples/`](examples/). Point
+`SEARCH_SERVICE_URL` at a running service and:
+
+```sh
+SEARCH_SERVICE_URL=http://127.0.0.1:3000/search cargo run --example quickstart
+SEARCH_SERVICE_URL=http://127.0.0.1:3000/search cargo run --example filtering
+SEARCH_SERVICE_URL=http://127.0.0.1:3000/search cargo run --example faceted_search
+SEARCH_SERVICE_URL=http://127.0.0.1:3000/search cargo run --example vector_filtered_search
+```
+
+| Example | Shows |
+|---|---|
+| `quickstart` | create index, index docs, full-text search |
+| `filtering` | `bool` query with `term`/`terms`/`range`/`must_not` and nested `bool` |
+| `faceted_search` | `terms`/`range` aggregations + `post_filter` navigation |
+| `vector_filtered_search` | `knn`/`hybrid` restricted by a document filter |
 
 ## Errors
 

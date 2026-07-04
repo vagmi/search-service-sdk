@@ -62,13 +62,16 @@ impl Client {
 
     /// `GET /_indices` — list all indices.
     pub async fn list_indices(&self) -> Result<Vec<IndexInfo>> {
-        let list: IndicesList = self.send_json(self.http.get(self.url(&["_indices"]))).await?;
+        let list: IndicesList = self
+            .send_json(self.http.get(self.url(&["_indices"])))
+            .await?;
         Ok(list.indices)
     }
 
     /// `DELETE /{index}` — drop an index (and its chunk tables).
     pub async fn delete_index(&self, index: &str) -> Result<()> {
-        self.send_discard(self.http.delete(self.url(&[index]))).await
+        self.send_discard(self.http.delete(self.url(&[index])))
+            .await
     }
 
     /// `PUT /{index}/_mapping` — evolve the mapping; returns what changed.
@@ -92,12 +95,8 @@ impl Client {
         id: &str,
         document: &impl Serialize,
     ) -> Result<()> {
-        self.send_discard(
-            self.http
-                .put(self.url(&[index, "_doc", id]))
-                .json(document),
-        )
-        .await
+        self.send_discard(self.http.put(self.url(&[index, "_doc", id])).json(document))
+            .await
     }
 
     /// `POST /{index}/_doc` — index a document with a server-generated id (returned).
@@ -169,18 +168,27 @@ mod tests {
     #[test]
     fn builds_urls_under_a_nested_base() {
         let c = Client::new("http://localhost:3000/search").unwrap();
-        assert_eq!(c.url(&["posts"]).as_str(), "http://localhost:3000/search/posts");
+        assert_eq!(
+            c.url(&["posts"]).as_str(),
+            "http://localhost:3000/search/posts"
+        );
         assert_eq!(
             c.url(&["posts", "_doc", "id-1"]).as_str(),
             "http://localhost:3000/search/posts/_doc/id-1"
         );
-        assert_eq!(c.url(&["_indices"]).as_str(), "http://localhost:3000/search/_indices");
+        assert_eq!(
+            c.url(&["_indices"]).as_str(),
+            "http://localhost:3000/search/_indices"
+        );
     }
 
     #[test]
     fn builds_urls_at_root_and_encodes() {
         let c = Client::new("http://localhost:3000").unwrap();
-        assert_eq!(c.url(&["posts", "_search"]).as_str(), "http://localhost:3000/posts/_search");
+        assert_eq!(
+            c.url(&["posts", "_search"]).as_str(),
+            "http://localhost:3000/posts/_search"
+        );
         // path segments are percent-encoded.
         assert_eq!(
             c.url(&["posts", "_doc", "a b/c"]).as_str(),

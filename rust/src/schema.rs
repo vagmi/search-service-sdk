@@ -168,10 +168,19 @@ mod tests {
             .text("title", Some("english"))
             .keyword("tags")
             .scalar("views", FieldType::Integer)
-            .vector("embedding", "gemini", "gemini-embedding-2", 1536, Some("retrieval"))
+            .vector(
+                "embedding",
+                "gemini",
+                "gemini-embedding-2",
+                1536,
+                Some("retrieval"),
+            )
             .build();
         let v = serde_json::to_value(&schema).unwrap();
-        assert_eq!(v["fields"]["title"], serde_json::json!({"type":"text","analyzer":"english"}));
+        assert_eq!(
+            v["fields"]["title"],
+            serde_json::json!({"type":"text","analyzer":"english"})
+        );
         assert_eq!(v["fields"]["tags"], serde_json::json!({"type":"keyword"}));
         assert_eq!(v["fields"]["views"], serde_json::json!({"type":"integer"}));
         assert_eq!(
