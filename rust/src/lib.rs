@@ -53,5 +53,7 @@ pub use query::{
     Agg, BoolFilter, BoolQuery, ExistsClause, Filter, MultiMatch, QueryClause, RangeAgg,
     RangeBounds, RangeBucketDef, RangeFilter, SearchRequest, TermsAgg, VectorQuery,
 };
-pub use response::{AggResult, Bucket, Document, Hit, Hits, SearchResponse, Total};
+pub use response::{
+    AggResult, Bucket, Document, EmbedUsage, Hit, Hits, IndexAck, SearchResponse, Total,
+};
 pub use schema::{FieldDef, FieldType, IndexInfo, MappingChanges, Schema, SchemaBuilder};

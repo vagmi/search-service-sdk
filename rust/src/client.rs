@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 use url::Url;
 
 use crate::error::{Error, Result};
-use crate::response::{DocAck, IndicesList};
+use crate::response::{DocAck, IndexAck, IndicesList};
 use crate::schema::{IndexInfo, MappingChanges, Schema};
 use crate::{Document, SearchRequest, SearchResponse};
 
@@ -89,22 +89,39 @@ impl Client {
     // --- documents ---
 
     /// `PUT /{index}/_doc/{id}` — index (upsert) a document with a client-supplied id.
+    ///
+    /// The returned [`IndexAck`] carries `usage` when the write embedded
+    /// anything, so a caller keeping its own usage ledger can attribute the cost.
+    /// Callers that don't care can ignore it.
     pub async fn index_document(
         &self,
         index: &str,
         id: &str,
         document: &impl Serialize,
-    ) -> Result<()> {
-        self.send_discard(self.http.put(self.url(&[index, "_doc", id])).json(document))
+    ) -> Result<IndexAck> {
+        self.send_json(self.http.put(self.url(&[index, "_doc", id])).json(document))
             .await
     }
 
     /// `POST /{index}/_doc` — index a document with a server-generated id (returned).
+    ///
+    /// Use [`Client::create_document_acked`] when the embedding usage matters.
     pub async fn create_document(&self, index: &str, document: &impl Serialize) -> Result<String> {
         let ack: DocAck = self
             .send_json(self.http.post(self.url(&[index, "_doc"])).json(document))
             .await?;
         Ok(ack.id)
+    }
+
+    /// `POST /{index}/_doc` — as [`Client::create_document`], but returning the
+    /// full acknowledgement including embedding usage.
+    pub async fn create_document_acked(
+        &self,
+        index: &str,
+        document: &impl Serialize,
+    ) -> Result<IndexAck> {
+        self.send_json(self.http.post(self.url(&[index, "_doc"])).json(document))
+            .await
     }
 
     /// `GET /{index}/_doc/{id}` — fetch a document.
