@@ -10,7 +10,9 @@
 //!
 //! The `vector` parts require the server to have a working embedder.
 
-use search_service::{Agg, Client, FieldType, Filter, QueryClause, Schema, SearchRequest};
+use search_service::{
+    Agg, Client, FieldType, Filter, QueryClause, Schema, SearchRequest, VectorQuery,
+};
 use serde_json::json;
 
 const INDEX: &str = "sdk_live_test";
@@ -117,6 +119,55 @@ async fn full_sdk_lifecycle() {
         top.chunk_id.is_some() && top.content.is_some(),
         "chunk hit shape"
     );
+    // A knn `_score` *is* the cosine similarity, and the server echoes it raw.
+    if let Some(cosine) = top.cosine() {
+        assert!((-1.0..=1.0).contains(&cosine), "cosine in range: {cosine}");
+        assert_eq!(Some(cosine), top.score, "knn score is the cosine");
+    }
+
+    // A similarity floor gates the vector leg: an unrelated query returns nothing
+    // rather than a page of nearest neighbours.
+    let res = client
+        .search(
+            INDEX,
+            &SearchRequest::new(QueryClause::Knn(
+                VectorQuery::new("embedding", "zzqx wholly unrelated gibberish")
+                    .min_similarity(0.99),
+            )),
+        )
+        .await
+        .expect("floored knn search");
+    assert!(
+        res.hits.hits.is_empty(),
+        "a 0.99 similarity floor admits nothing: {:?}",
+        res.hits.hits.len()
+    );
+
+    // Hybrid hits report which leg produced them.
+    let res = client
+        .search(
+            INDEX,
+            &SearchRequest::new(QueryClause::hybrid("embedding", "lexical semantic")),
+        )
+        .await
+        .expect("hybrid search");
+    for hit in &res.hits.hits {
+        let rank = hit.rank.expect("hybrid hits carry provenance");
+        assert!(
+            rank.bm25.is_some() || rank.vector.is_some(),
+            "a fused hit came from at least one leg"
+        );
+        assert_eq!(
+            hit.is_lexical_match(),
+            rank.bm25.is_some(),
+            "is_lexical_match tracks the bm25 rank"
+        );
+        let score = hit.score.expect("hybrid hits are scored");
+        assert!(
+            score > 0.0 && score <= 2.0 / 61.0 + 1e-9,
+            "rrf score {score} within its k=60 ceiling"
+        );
+    }
 
     // update_mapping (add a field)
     let evolved = Schema::builder()

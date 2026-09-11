@@ -19,6 +19,12 @@ pub struct SearchRequest {
     pub size: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<i64>,
+    /// Drop hits scoring below this. Only meaningful *per query type* — see
+    /// [`crate::Hit::score`] for what `_score` holds in each case. A value tuned for
+    /// `match` means nothing for `hybrid`, whose scores are bounded by
+    /// `Σweights/(rrf_k + 1)` (0.0328 at the defaults).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_score: Option<f64>,
     /// Facets, computed over the full matching set (independent of `size`/`from`).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub aggs: BTreeMap<String, Agg>,
@@ -34,6 +40,7 @@ impl SearchRequest {
             query: query.into(),
             size: None,
             from: None,
+            min_score: None,
             aggs: BTreeMap::new(),
             post_filter: Vec::new(),
         }
@@ -49,6 +56,15 @@ impl SearchRequest {
     /// Offset (defaults to 0 when unset).
     pub fn from(mut self, from: i64) -> Self {
         self.from = Some(from);
+        self
+    }
+
+    /// Drop hits scoring below `min_score`. The threshold is in whatever units the
+    /// query type's `_score` uses, so it is not portable between query types. For
+    /// `knn`, prefer [`VectorQuery::min_similarity`], which the service pushes into
+    /// SQL rather than applying to an already-fetched candidate window.
+    pub fn min_score(mut self, min_score: f64) -> Self {
+        self.min_score = Some(min_score);
         self
     }
 
@@ -136,15 +152,54 @@ pub struct MultiMatch {
 pub struct VectorQuery {
     pub field: String,
     pub query: String,
-    /// Candidate depth per modality (defaults to `size`).
+    /// Candidate *depth* — how many chunks each modality retrieves before fusion
+    /// and paging. `size` truncates the page; `k` does not set it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub k: Option<i64>,
     /// RRF constant for `hybrid` (defaults to 60).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rrf_k: Option<f64>,
+    /// Cosine-similarity floor in `[-1, 1]`. Unset ⇒ no floor, which is the ANN
+    /// default: nearest neighbours always exist, so an unrelated query still comes
+    /// back with a full page. Setting it gates the vector leg the way BM25 already
+    /// is, letting "nothing is close enough" return no hits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_similarity: Option<f64>,
+    /// Relative trust in each `hybrid` leg. Unset ⇒ an even 1.0/1.0 fusion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weights: Option<HybridWeights>,
+    /// Keep only the best-scoring chunk per parent document, so one long document
+    /// cannot fill the page with its own chunks.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub collapse: bool,
     /// Filter context on the parent document's fields.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub filter: Vec<Filter>,
+}
+
+/// Per-leg weights for `hybrid` fusion. Unweighted RRF locks lexical and semantic
+/// evidence at 50/50; raising `bm25` biases toward chunks where the query terms
+/// genuinely occur. Both must be non-negative and not both zero, or the service
+/// returns a 400.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct HybridWeights {
+    pub vector: f64,
+    pub bm25: f64,
+}
+
+impl HybridWeights {
+    pub fn new(vector: f64, bm25: f64) -> Self {
+        Self { vector, bm25 }
+    }
+}
+
+impl Default for HybridWeights {
+    fn default() -> Self {
+        Self {
+            vector: 1.0,
+            bm25: 1.0,
+        }
+    }
 }
 
 impl VectorQuery {
@@ -154,10 +209,15 @@ impl VectorQuery {
             query: query.to_string(),
             k: None,
             rrf_k: None,
+            min_similarity: None,
+            weights: None,
+            collapse: false,
             filter: Vec::new(),
         }
     }
 
+    /// Candidate depth per modality. This is *not* the page size — set that with
+    /// [`SearchRequest::size`], which truncates the fused page.
     pub fn k(mut self, k: i64) -> Self {
         self.k = Some(k);
         self
@@ -165,6 +225,25 @@ impl VectorQuery {
 
     pub fn rrf_k(mut self, rrf_k: f64) -> Self {
         self.rrf_k = Some(rrf_k);
+        self
+    }
+
+    /// Require at least this cosine similarity (in `[-1, 1]`) from the vector leg.
+    /// Without it an ANN scan returns its whole window for any query at all.
+    pub fn min_similarity(mut self, min_similarity: f64) -> Self {
+        self.min_similarity = Some(min_similarity);
+        self
+    }
+
+    /// Weight the two `hybrid` legs relative to each other (no effect on `knn`).
+    pub fn weights(mut self, vector: f64, bm25: f64) -> Self {
+        self.weights = Some(HybridWeights::new(vector, bm25));
+        self
+    }
+
+    /// Return only the best-scoring chunk per parent document.
+    pub fn collapse(mut self, collapse: bool) -> Self {
+        self.collapse = collapse;
         self
     }
 
@@ -579,6 +658,43 @@ mod tests {
                 "field": "embedding", "query": "q", "k": 20,
                 "filter": [ { "term": { "tags": "db" } } ]
             }}})
+        );
+    }
+
+    #[test]
+    fn scoring_controls_serialize() {
+        let req = SearchRequest::new(QueryClause::Hybrid(
+            VectorQuery::new("embedding", "x")
+                .k(200)
+                .min_similarity(0.6)
+                .weights(1.0, 3.0)
+                .collapse(true),
+        ))
+        .size(10)
+        .min_score(0.02);
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            json!({
+                "query": { "hybrid": {
+                    "field": "embedding", "query": "x", "k": 200,
+                    "min_similarity": 0.6,
+                    "weights": { "vector": 1.0, "bm25": 3.0 },
+                    "collapse": true
+                }},
+                "size": 10, "min_score": 0.02
+            })
+        );
+    }
+
+    /// The new knobs are opt-in: an untouched query must serialize exactly as it did
+    /// before they existed, or every existing caller starts sending new fields.
+    #[test]
+    fn scoring_controls_are_omitted_when_unset() {
+        let req = SearchRequest::new(QueryClause::knn("embedding", "rank fusion"));
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            json!({ "query": { "knn": { "field": "embedding", "query": "rank fusion" } } }),
+            "collapse=false and the unset options must not appear in the body"
         );
     }
 

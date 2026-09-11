@@ -50,10 +50,11 @@ mod schema;
 pub use client::Client;
 pub use error::{Error, Result};
 pub use query::{
-    Agg, BoolFilter, BoolQuery, ExistsClause, Filter, MultiMatch, QueryClause, RangeAgg,
-    RangeBounds, RangeBucketDef, RangeFilter, SearchRequest, TermsAgg, VectorQuery,
+    Agg, BoolFilter, BoolQuery, ExistsClause, Filter, HybridWeights, MultiMatch, QueryClause,
+    RangeAgg, RangeBounds, RangeBucketDef, RangeFilter, SearchRequest, TermsAgg, VectorQuery,
 };
 pub use response::{
-    AggResult, Bucket, Document, EmbedUsage, Hit, Hits, IndexAck, SearchResponse, Total,
+    AggResult, Bucket, Document, EmbedUsage, Hit, HitRank, HitScores, Hits, IndexAck,
+    SearchResponse, Total,
 };
 pub use schema::{FieldDef, FieldType, IndexInfo, MappingChanges, Schema, SchemaBuilder};

@@ -43,8 +43,11 @@ async fn main() -> search_service::Result<()> {
         &SearchRequest::new(QueryClause::hybrid("embedding", "retire elasticsearch"))).await?;
     for hit in res.hits.hits {
         // chunk hits carry chunk_id / seq / content; document hits carry source / meta.
-        // `score` is None for filter-only queries (a `bool` with no scoring `must`).
-        println!("{} ({:.3}) {:?}", hit.id, hit.score.unwrap_or(0.0), hit.content);
+        // `score` is None for filter-only queries (a `bool` with no scoring `must`),
+        // and means something different per query type — see "Scores and ranking".
+        // `is_lexical_match()` says whether the query terms actually occur in it.
+        println!("{} ({:.4}) lexical={} {:?}",
+            hit.id, hit.score.unwrap_or(0.0), hit.is_lexical_match(), hit.content);
     }
     Ok(())
 }
@@ -118,6 +121,81 @@ if let Some(tags) = res.agg("tags") {
 }
 ```
 
+## Scores and ranking
+
+`hit.score` holds **a different quantity per query type**, and the values are not
+comparable across them:
+
+| Query | `score` is | Range |
+|---|---|---|
+| `match` / `multi_match` | summed BM25 over the queried fields | positive, unbounded, corpus-dependent |
+| `knn` | cosine similarity (also `hit.cosine()`) | `[-1, 1]` |
+| `hybrid` | RRF score, `Σ wᵢ/(rrf_k + rankᵢ)` | `(0, Σw/(rrf_k+1)]` — **0.0328** at the defaults |
+| filter-only `bool` | `None` — nothing scored it | — |
+
+### Why a `hybrid` score can't tell you if a hit is real
+
+RRF fuses rank into a scalar, which discards *which* leg produced a chunk. A chunk
+ranked first by BM25 and absent from the vector list, and one ranked first by the
+vector leg and absent from BM25, both score exactly `1/(rrf_k + 1)`. `hit.rank`
+carries the per-leg ranks so you can separate them:
+
+```rust
+for hit in &res.hits.hits {
+    match hit.rank.unwrap_or_default() {
+        r if r.bm25.is_some() => println!("{}: query terms genuinely occur", hit.id),
+        r if r.vector.is_some() => println!("{}: nearest-neighbour only", hit.id),
+        _ => {}
+    }
+}
+
+// Or the short form — true only when the BM25 leg matched:
+let genuine: Vec<_> = res.hits.hits.iter().filter(|h| h.is_lexical_match()).collect();
+```
+
+`rank.bm25` is `Some` only when the query terms occur in the chunk, because that
+leg is gated on a real lexical match. `rank.vector` is the chunk's place in the ANN
+candidate window — populated for *any* query at all, which is the next point.
+
+### Gating the vector leg
+
+An ANN scan has no notion of "no match": nearest neighbours always exist, so an
+unrelated query still returns a full page of plausible-looking hits.
+`min_similarity` gates it the way BM25 is already gated (the service pushes the
+floor into SQL rather than filtering fetched rows):
+
+```rust
+let q = VectorQuery::new("embedding", "wholly unrelated text").min_similarity(0.7);
+let res = client.search("posts", &SearchRequest::new(QueryClause::Hybrid(q))).await?;
+assert!(res.hits.hits.is_empty()); // nothing was close enough
+```
+
+### Tuning the fusion
+
+```rust
+let q = VectorQuery::new("embedding", "retire elasticsearch")
+    .k(200)               // candidate depth per leg — NOT the page size
+    .weights(1.0, 3.0)    // (vector, bm25): trust lexical evidence 3x
+    .collapse(true)       // one best chunk per parent document
+    .min_similarity(0.6);
+let res = client.search("posts",
+    &SearchRequest::new(QueryClause::Hybrid(q)).size(10).min_score(0.01)).await?;
+```
+
+`min_score` drops hits below a threshold, in whatever units that query type's score
+uses — a value tuned for `match` is meaningless for `hybrid`. On document queries
+the service folds it into the match predicate, so `total` and the facet counts stay
+consistent with the returned hits.
+
+> **`k` is candidate depth, not page size.** `size` truncates the page. A recent
+> service change made this so: `k(100)` with the default `size` now yields 10 hits
+> drawn from 100 candidates, where it previously returned 100.
+
+> `hits.total.value` is the total matching documents for `match`/`multi_match`/`bool`.
+> For `knn`/`hybrid` it is the size of the retained candidate set (after
+> `min_similarity`, `min_score` and `collapse`) — a top-k ANN scan has no cheap exact
+> count to report.
+
 ## Filtered vector search
 
 `knn`/`hybrid` accept a `filter` on the parent document's fields (ES `knn.filter`);
@@ -143,6 +221,7 @@ SEARCH_SERVICE_URL=http://127.0.0.1:3000/search cargo run --example quickstart
 SEARCH_SERVICE_URL=http://127.0.0.1:3000/search cargo run --example filtering
 SEARCH_SERVICE_URL=http://127.0.0.1:3000/search cargo run --example faceted_search
 SEARCH_SERVICE_URL=http://127.0.0.1:3000/search cargo run --example vector_filtered_search
+SEARCH_SERVICE_URL=http://127.0.0.1:3000/search cargo run --example score_semantics
 ```
 
 | Example | Shows |
@@ -151,6 +230,7 @@ SEARCH_SERVICE_URL=http://127.0.0.1:3000/search cargo run --example vector_filte
 | `filtering` | `bool` query with `term`/`terms`/`range`/`must_not` and nested `bool` |
 | `faceted_search` | `terms`/`range` aggregations + `post_filter` navigation |
 | `vector_filtered_search` | `knn`/`hybrid` restricted by a document filter |
+| `score_semantics` | what `_score` means per query type, hit provenance, similarity floors, fusion weights |
 
 ## Errors
 
